@@ -914,7 +914,7 @@ mlx5_tx_burst_ipoib(void *dpdk_txq, struct rte_mbuf **pkts, uint16_t pkts_n)
 					     MLX5_WQE_SIZE);
 
 	if (unlikely(!pkts_n)) {
-	    RTE_LOG(ERR, PMD, "mlx5_tx_burst_ipoib: no packets were provided\n");
+		RTE_LOG(ERR, PMD, "mlx5_tx_burst_ipoib: no packets were provided\n");
 		return 0;
 	}
 	/* Prefetch first packet cacheline. */
@@ -926,8 +926,8 @@ mlx5_tx_burst_ipoib(void *dpdk_txq, struct rte_mbuf **pkts, uint16_t pkts_n)
 		max -= elts_n;
 	max_wqe = (1u << txq->wqe_n) - (txq->wqe_ci - txq->wqe_pi);
 	if (unlikely(!max_wqe)) {
-	    RTE_LOG(ERR, PMD, "mlx5_tx_burst_ipoib: max_wqe=%d, wqe_ci=%d, wqe_pi=%d\n",
-               max_wqe, txq->wqe_ci, txq->wqe_pi);
+		RTE_LOG(ERR, PMD, "mlx5_tx_burst_ipoib: max_wqe=%d, wqe_ci=%d, wqe_pi=%d\n",
+		       max_wqe, txq->wqe_ci, txq->wqe_pi);
 		return 0;
 	}
 	do {
@@ -953,19 +953,19 @@ mlx5_tx_burst_ipoib(void *dpdk_txq, struct rte_mbuf **pkts, uint16_t pkts_n)
 		 */
 		assert(segs_n);
 		if (max < segs_n + 1) {
-		    RTE_LOG(ERR, PMD, "mlx5_tx_burst_ipoib: not enough elts for segs "
-                   " max=%d, elts_head=%d, elts_tail=%d, segs=%d\n",
-                   max, txq->elts_head, txq->elts_tail, segs_n);
-            break;
-        }
+			RTE_LOG(ERR, PMD, "mlx5_tx_burst_ipoib: not enough elts for segs "
+			       " max=%d, elts_head=%d, elts_tail=%d, segs=%d\n",
+			       max, txq->elts_head, txq->elts_tail, segs_n);
+			break;
+		}
 		max -= segs_n;
 		--segs_n;
 		/* Each IPoIB WQE is at least 2 MLX5 WQEs. */
 		max_wqe -= 2;
 		if (unlikely(max_wqe <= 0)) {
-		    RTE_LOG(ERR, PMD, "mlx5_tx_burst_ipoib: not even 2 wqes"
-                  "max_wqe=%d, wqe_ci=%d, wqe_pi=%d\n",
-                  max_wqe, txq->wqe_ci, txq->wqe_pi);
+			RTE_LOG(ERR, PMD, "mlx5_tx_burst_ipoib: not even 2 wqes"
+			       "max_wqe=%d, wqe_ci=%d, wqe_pi=%d\n",
+			       max_wqe, txq->wqe_ci, txq->wqe_pi);
 			break;
 		}
 		wqe = (volatile struct mlx5_wqe_ipoib_v *)
@@ -1059,10 +1059,8 @@ mlx5_tx_burst_ipoib(void *dpdk_txq, struct rte_mbuf **pkts, uint16_t pkts_n)
 			if (length > 0) {
 				if (ds % (MLX5_WQE_SIZE /
 					  MLX5_WQE_DWORD_SIZE) == 0) {
-					if (unlikely(--max_wqe == 0)) {
-					    RTE_LOG(ERR, PMD, "mlx5_tx_burst_ipoib: need another wqe for dseg\n");
+					if (unlikely(--max_wqe == 0))
 						break;
-					}
 					dseg = (volatile rte_v128u32_t *)
 					       tx_mlx5_wqe(txq, txq->wqe_ci +
 							   ds / 4);
@@ -1113,8 +1111,10 @@ next_seg:
 		 */
 		assert(!(MLX5_WQE_SIZE % MLX5_WQE_DWORD_SIZE));
 		if (!(ds % (MLX5_WQE_SIZE / MLX5_WQE_DWORD_SIZE))) {
-			if (unlikely(--max_wqe == 0))
+			if (unlikely(--max_wqe == 0)) {
+				RTE_LOG(ERR, PMD, "mlx5_tx_burst_ipoib: need another wqe for dseg\n");
 				break;
+			}
 			dseg = (volatile rte_v128u32_t *)
 			       tx_mlx5_wqe(txq, txq->wqe_ci + ds / 4);
 			rte_prefetch0(tx_mlx5_wqe(txq,
