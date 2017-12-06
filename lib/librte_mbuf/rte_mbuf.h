@@ -1074,7 +1074,7 @@ rte_pktmbuf_priv_size(struct rte_mempool *mp)
  */
 static inline void rte_pktmbuf_reset_headroom(struct rte_mbuf *m)
 {
-	m->data_off = RTE_MIN(RTE_PKTMBUF_HEADROOM, (uint16_t)m->buf_len);
+	m->data_off = RTE_PKTMBUF_HEADROOM;
 }
 
 /**
@@ -1102,6 +1102,17 @@ static inline void rte_pktmbuf_reset(struct rte_mbuf *m)
 	m->data_len = 0;
 	__rte_mbuf_sanity_check(m, 1);
 }
+
+static inline void rte_pktmbuf_reset_min(struct rte_mbuf *m)
+{
+	// m->tx_offload = 0; // unneeded as we set it before send, and this is a different cache line
+	m->vlan_tci = 0;
+	m->vlan_tci_outer = 0;
+
+	m->ol_flags = 0;
+	m->packet_type = 0;
+}
+
 
 /**
  * Allocate a new mbuf from a mempool.
@@ -1147,33 +1158,24 @@ static inline int rte_pktmbuf_alloc_bulk(struct rte_mempool *pool,
 	if (unlikely(rc))
 		return rc;
 
-	/* To understand duff's device on loop unwinding optimization, see
-	 * https://en.wikipedia.org/wiki/Duff's_device.
-	 * Here while() loop is used rather than do() while{} to avoid extra
-	 * check if count is zero.
-	 */
-	switch (count % 4) {
-	case 0:
-		while (idx != count) {
-			MBUF_RAW_ALLOC_CHECK(mbufs[idx]);
-			rte_pktmbuf_reset(mbufs[idx]);
+	if (count > 2) {
+		rte_prefetch0(mbufs[1]);
+		//rte_prefetch0(((uint8_t *)mbufs[1]) + 64);
+		rte_prefetch0(mbufs[2]);
+		//rte_prefetch0(((uint8_t *)mbufs[2]) + 64);
+		while (idx < count-3) {
+			rte_prefetch0(mbufs[idx + 3]);
+			//rte_prefetch0(((uint8_t *)mbufs[idx + 3]) + 64);
+			rte_pktmbuf_reset_min(mbufs[idx]);
 			idx++;
-			/* fall-through */
-	case 3:
-			MBUF_RAW_ALLOC_CHECK(mbufs[idx]);
-			rte_pktmbuf_reset(mbufs[idx]);
+		}
+		rte_pktmbuf_reset_min(mbufs[count-3]);
+		rte_pktmbuf_reset_min(mbufs[count-2]);
+		rte_pktmbuf_reset_min(mbufs[count-1]);
+	} else {
+		while (idx < count) {
+			rte_pktmbuf_reset_min(mbufs[idx]);
 			idx++;
-			/* fall-through */
-	case 2:
-			MBUF_RAW_ALLOC_CHECK(mbufs[idx]);
-			rte_pktmbuf_reset(mbufs[idx]);
-			idx++;
-			/* fall-through */
-	case 1:
-			MBUF_RAW_ALLOC_CHECK(mbufs[idx]);
-			rte_pktmbuf_reset(mbufs[idx]);
-			idx++;
-			/* fall-through */
 		}
 	}
 	return 0;
