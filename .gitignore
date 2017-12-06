@@ -12,3 +12,7 @@ GPATH
 GRTAGS
 tags
 TAGS
+.cproject
+.project
+.settings/
+
