@@ -35,6 +35,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+#include <rte_log.h>
 
 /* Verbs header. */
 /* ISO C doesn't support unnamed structs/unions, disabling -pedantic. */
@@ -2258,6 +2259,62 @@ rxq_cq_to_ol_flags(struct rxq *rxq, volatile struct mlx5_cqe *cqe)
 	return ol_flags;
 }
 
+#define REFILL_RING_THREASHOLD  (64)
+#define WEKA_DATA_LEN_SIZE      (5120)
+
+/*
+ * Allocates and enqueues up to `rxq->refill_count` back into the rxq;
+ * updates rxq->refill_count as it goes.
+ *
+ * Returns 0 on success (meaning rxq->refill_count==0 at the end)
+ *     or whatever error code is returned from rte_pktmbuf_alloc_bulk.
+ */
+static inline int mlx5_refill_rx_ring(struct rxq *rxq, unsigned int first_idx, signed int rel_data_offset) {
+    //RTE_LOG(ERR, PMD, "PMD: mlx5_refill_rx_ring: rxq=%p segs_n=%d rel_data_offset=%d\n", rxq, segs_n, rel_data_offset);
+	const unsigned int wqe_cnt = (1 << rxq->elts_n) - 1;
+	unsigned char port = rxq->port_id;
+	unsigned int idx = first_idx;
+	unsigned int refill_count = rxq->refill_count;
+	int ret = 0;
+
+	while (refill_count > 0) {
+		struct rte_mbuf **elts = &(*rxq->elts)[idx];
+		unsigned int elts_till_wraparound = wqe_cnt + 1 - idx;
+		unsigned int batch_size = refill_count > elts_till_wraparound ? elts_till_wraparound : refill_count;
+
+		ret = rte_pktmbuf_alloc_bulk(rxq->mp, elts, batch_size);
+		if (ret != 0) {
+            RTE_LOG(ERR, PMD, "PMD: RX ring couldn't be replenished, missing %d pkts (batch_size=%d)\n",
+                    refill_count, batch_size);
+		    ++rxq->stats.rx_nombuf;
+			break;
+		}
+		refill_count -= batch_size;
+		for (; batch_size > 0; ++elts, --batch_size) {
+			struct rte_mbuf *mbuf = *elts;
+			volatile struct mlx5_wqe_data_seg *wqe = &(*rxq->wqes)[idx];
+			/* TODO: why is this 5K ? */
+			DATA_LEN(mbuf) = WEKA_DATA_LEN_SIZE;
+			PKT_LEN(mbuf) = WEKA_DATA_LEN_SIZE;
+			SET_DATA_OFF(mbuf, RTE_PKTMBUF_HEADROOM);
+			NB_SEGS(mbuf) = 1;
+			PORT(mbuf) = port;
+			NEXT(mbuf) = NULL;
+			/*
+			 * Fill NIC descriptor with the new buffer.  The lkey and size
+			 * of the buffers are already known, only the buffer address
+			 * changes.
+			 */
+			wqe->addr = htonll((uintptr_t)((char *)mbuf + RTE_PKTMBUF_HEADROOM + sizeof(struct rte_mbuf) + rel_data_offset));
+            //RTE_LOG(ERR, PMD, "PMD: refilled idx %d with: %lx mbuf=%p\n", idx, wqe->addr, mbuf);
+			idx = (idx + 1) & wqe_cnt;
+		}
+	}
+
+	rxq->refill_count = refill_count;
+	return ret;
+}
+
 /**
  * DPDK callback for RX.
  *
@@ -2284,51 +2341,42 @@ mlx5_rx_burst_eth(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 		&(*rxq->cqes)[rxq->cq_ci & cqe_cnt];
 	unsigned int i = 0;
 	unsigned int rq_ci = rxq->rq_ci << sges_n;
+	unsigned int first_idx = rq_ci & wqe_cnt;
 	int len = 0; /* keep its value across iterations. */
+
+	rte_prefetch0(cqe);
+	rte_prefetch0(cqe+1);
+	rte_prefetch0(cqe+2);
+	// prefetch the next cache line (no point in prefetching the current)
+	rte_prefetch0(&(*rxq->elts)[(first_idx + (64/sizeof(struct rte_mbuf *))) & wqe_cnt]);
 
 	while (pkts_n) {
 		unsigned int idx = rq_ci & wqe_cnt;
-		volatile struct mlx5_wqe_data_seg *wqe = &(*rxq->wqes)[idx];
 		struct rte_mbuf *rep = (*rxq->elts)[idx];
+		unsigned int next_idx = (idx + 1) & wqe_cnt;
 		uint32_t rss_hash_res = 0;
+		cqe = &(*rxq->cqes)[rxq->cq_ci & cqe_cnt];
 
+		if ((idx & 4) == 0) {
+			struct rte_mbuf **next_mbufs_cache_line = &(*rxq->elts)[(idx + (64/sizeof(struct rte_mbuf *))) & wqe_cnt];
+			// we start a new cache line, prefetch the next one
+			rte_prefetch0(next_mbufs_cache_line);
+		}
+		rte_prefetch0(cqe+3); // we're allowed to prefetch invalid addresses
+		rte_prefetch0((*rxq->elts)[next_idx]); // prefetch the next mbuf header
 		if (pkt)
 			NEXT(seg) = rep;
 		seg = rep;
-		rte_prefetch0(seg);
-		rte_prefetch0(cqe);
-		rte_prefetch0(wqe);
-		rep = rte_mbuf_raw_alloc(rxq->mp);
-		if (unlikely(rep == NULL)) {
-			++rxq->stats.rx_nombuf;
-			if (!pkt) {
-				/*
-				 * no buffers before we even started,
-				 * bail out silently.
-				 */
-				break;
-			}
-			while (pkt != seg) {
-				assert(pkt != (*rxq->elts)[idx]);
-				rep = NEXT(pkt);
-				NEXT(pkt) = NULL;
-				NB_SEGS(pkt) = 1;
-				rte_mbuf_raw_free(pkt);
-				pkt = rep;
-			}
-			break;
-		}
+
 		if (!pkt) {
-			cqe = &(*rxq->cqes)[rxq->cq_ci & cqe_cnt];
 			len = mlx5_rx_poll_len(rxq, cqe, cqe_cnt,
 					       &rss_hash_res);
 			if (!len) {
-				rte_mbuf_raw_free(rep);
 				break;
 			}
 			if (unlikely(len == -1)) {
+				RTE_LOG(ERR, PMD, "PMD: len is -1\n");
 				/* RX error, packet is likely too large. */
-				rte_mbuf_raw_free(rep);
 				++rxq->stats.idropped;
 				goto skip;
 			}
@@ -2368,19 +2416,7 @@ mlx5_rx_burst_eth(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 				len -= ETHER_CRC_LEN;
 			PKT_LEN(pkt) = len;
 		}
-		DATA_LEN(rep) = DATA_LEN(seg);
-		PKT_LEN(rep) = PKT_LEN(seg);
-		SET_DATA_OFF(rep, DATA_OFF(seg));
-		NB_SEGS(rep) = NB_SEGS(seg);
-		PORT(rep) = PORT(seg);
-		NEXT(rep) = NULL;
-		(*rxq->elts)[idx] = rep;
-		/*
-		 * Fill NIC descriptor with the new buffer.  The lkey and size
-		 * of the buffers are already known, only the buffer address
-		 * changes.
-		 */
-		wqe->addr = htonll(rte_pktmbuf_mtod(rep, uintptr_t));
+		//RTE_LOG(ERR, PMD, "PMD: mlx5_rx_burst got: %p i=%d rq_ci=%d rxq->rq_ci=%d len=%d seg->len=%d pkt_len=%d offset=%d idx=%d\n", pkt, i, rq_ci, rxq->rq_ci, len, DATA_LEN(seg), PKT_LEN(seg), DATA_OFF(seg), idx);
 		if (len > DATA_LEN(seg)) {
 			len -= DATA_LEN(seg);
 			++NB_SEGS(pkt);
@@ -2405,6 +2441,13 @@ skip:
 	}
 	if (unlikely((i == 0) && ((rq_ci >> sges_n) == rxq->rq_ci)))
 		return 0;
+	assert(sges_n == 0); // mlx5_refill_rx_ring() doesn't yet support any other value
+	rxq->refill_count += i;
+	if (rxq->refill_count >= REFILL_RING_THREASHOLD) {
+		unsigned int refill_start = (rq_ci + wqe_cnt + 1 - rxq->refill_count) & wqe_cnt;
+		// RTE_LOG(ERR, PMD, "PMD: will refill %d pkts starting at %d. first_idx=%d i=%d rq_ci=%d rxq->rq_ci=%d wqe_cnt=%d\n", rxq->refill_count, refill_start, first_idx, i, rq_ci, rxq->rq_ci, wqe_cnt);
+		mlx5_refill_rx_ring(rxq, refill_start, 0);
+	}
 	/* Update the consumer index. */
 	rxq->rq_ci = rq_ci >> sges_n;
 	rte_wmb();
@@ -2444,49 +2487,41 @@ mlx5_rx_burst_ipoib(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 		&(*rxq->cqes)[rxq->cq_ci & cqe_cnt];
 	unsigned int i = 0;
 	unsigned int rq_ci = rxq->rq_ci << sges_n;
+	unsigned int first_idx = rq_ci & wqe_cnt;
 	int len = 0; /* keep its value across iterations. */
+
+    rte_prefetch0(cqe);
+    // prefetch the next cache line (no point in prefetching the current)
+    rte_prefetch0(&(*rxq->elts)[(first_idx + (64/sizeof(struct rte_mbuf *))) & wqe_cnt]);
 
 	while (pkts_n) {
 		unsigned int idx = rq_ci & wqe_cnt;
-		volatile struct mlx5_wqe_data_seg *wqe = &(*rxq->wqes)[idx];
 		struct rte_mbuf *rep = (*rxq->elts)[idx];
+		unsigned int next_idx = (idx + 1) & wqe_cnt;
 		uint32_t rss_hash_res = 0;
+
+        if ((idx & 4) == 0) {
+            struct rte_mbuf **next_mbufs_cache_line = &(*rxq->elts)[(idx + (64/sizeof(struct rte_mbuf *))) & wqe_cnt];
+            // we start a new cache line, prefetch the next one
+            rte_prefetch0(next_mbufs_cache_line);
+        }
+        rte_prefetch0((*rxq->elts)[next_idx]); // prefetch the next mbuf header
 
 		if (pkt)
 			NEXT(seg) = rep;
 		seg = rep;
-		rte_prefetch0(seg);
-		rte_prefetch0(cqe);
-		rte_prefetch0(wqe);
-		rep = rte_mbuf_raw_alloc(rxq->mp);
-		if (unlikely(rep == NULL)) {
-			++rxq->stats.rx_nombuf;
-			if (!pkt) {
-				/*
-				 * no buffers before we even started,
-				 * bail out silently.
-				 */
-				break;
-			}
-			while (pkt != seg) {
-				assert(pkt != (*rxq->elts)[idx]);
-				rep = NEXT(pkt);
-				NEXT(pkt) = NULL;
-				NB_SEGS(pkt) = 1;
-				rte_mbuf_raw_free(pkt);
-				pkt = rep;
-			}
-			break;
-		}
+
 		if (!pkt) {
 			cqe = &(*rxq->cqes)[rxq->cq_ci & cqe_cnt];
 			len = mlx5_rx_poll_len(rxq, cqe, cqe_cnt,
 					       &rss_hash_res);
+            volatile struct mlx5_cqe *next_cqe = &(*rxq->cqes)[rxq->cq_ci & cqe_cnt];
+            rte_prefetch0(next_cqe);
 			if (!len) {
-				rte_mbuf_raw_free(rep);
 				break;
 			}
 			if (unlikely(len == -1)) {
+				RTE_LOG(ERR, PMD, "PMD: len is -1\n");
 				/* RX error, packet is likely too large. */
 				rte_mbuf_raw_free(rep);
 				++rxq->stats.idropped;
@@ -2500,23 +2535,6 @@ mlx5_rx_burst_ipoib(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 			pkt->ol_flags = 0;
 			PKT_LEN(pkt) = len;
 		}
-		DATA_LEN(rep) = DATA_LEN(seg);
-		PKT_LEN(rep) = PKT_LEN(seg);
-		SET_DATA_OFF(rep, DATA_OFF(seg));
-		NB_SEGS(rep) = NB_SEGS(seg);
-		PORT(rep) = PORT(seg);
-		NEXT(rep) = NULL;
-		(*rxq->elts)[idx] = rep;
-		/*
-		 * Fill NIC descriptor with the new buffer.  The lkey and size
-		 * of the buffers are already known, only the buffer address
-		 * changes.
-		 * Since HW always preserves a place for the GRH, the wqe
-		 * pointer is set in way that will keep the packet data
-		 * aligned.
-		 */
-		wqe->addr = htonll(rte_pktmbuf_mtod(rep, uintptr_t) -
-				   GRH_HDR_LEN);
 		if (len > DATA_LEN(seg)) {
 			len -= DATA_LEN(seg);
 			++NB_SEGS(pkt);
@@ -2541,6 +2559,13 @@ skip:
 	}
 	if (unlikely((i == 0) && ((rq_ci >> sges_n) == rxq->rq_ci)))
 		return 0;
+    assert(sges_n == 0); // mlx5_refill_rx_ring() doesn't yet support any other value
+    rxq->refill_count += i;
+    if (rxq->refill_count >= REFILL_RING_THREASHOLD) {
+        unsigned int refill_start = (rq_ci + wqe_cnt + 1 - rxq->refill_count) & wqe_cnt;
+        // RTE_LOG(ERR, PMD, "PMD: will refill %d pkts starting at %d. first_idx=%d i=%d rq_ci=%d rxq->rq_ci=%d wqe_cnt=%d\n", rxq->refill_count, refill_start, first_idx, i, rq_ci, rxq->rq_ci, wqe_cnt);
+        mlx5_refill_rx_ring(rxq, refill_start, -GRH_HDR_LEN);
+    }
 	/* Update the consumer index. */
 	rxq->rq_ci = rq_ci >> sges_n;
 	rte_wmb();

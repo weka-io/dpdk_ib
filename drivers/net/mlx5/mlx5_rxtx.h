@@ -126,6 +126,7 @@ struct rxq {
 	struct rte_mbuf *(*elts)[];
 	struct rte_mempool *mp;
 	struct mlx5_rxq_stats stats;
+	uint16_t refill_count;
 } __rte_cache_aligned;
 
 /* RX queue control descriptor. */
